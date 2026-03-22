@@ -1,8 +1,10 @@
-# fast_greml
+# Fast GREML
 
 Fast multi-component GREML for partitioned heritability estimation from pre-computed GRMs.
 
 ## Overview
+
+`run_greml.py` provides a wrapper to use GCTA-like flags for REML estimation (with `--method` specifying either exact or stochastic).
 
 `greml.py` provides two AI-REML implementations that accept pre-computed dense GRM matrices (as produced by GCTA `--make-grm`) and return per-component heritability estimates with standard errors.
 
@@ -78,6 +80,7 @@ Both functions return a dict:
 |---|---|---|
 | `h2` | `ndarray (K,)` | Heritability per component: θ_k / Σθ |
 | `se` | `ndarray (K,)` | SE via delta method from AI⁻¹ |
+| `se_total_h2` | `float` | SE of total genetic variance fraction: Σ_k θ_k / Σθ |
 | `theta` | `ndarray (K+1,)` | Raw variance components σ²_1,…,σ²_e |
 | `n_iter` | `int` | AI-REML iterations taken |
 
@@ -85,7 +88,7 @@ Both functions return a dict:
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `n_probes` | `50` | Hutchinson probe vectors. 50 → ~1% trace error; 30 is sufficient for standardised phenotypes |
+| `n_probes` | `50` | Hutchinson probe vectors. Antithetic pairs are used when possible; odd counts add one independent probe. 50 → ~1% trace error; 30 is sufficient for standardised phenotypes |
 | `dtype` | `np.float32` | `float32` is ~2.85× faster on arm64/Accelerate. Safe because κ(V) ≈ 4–5 for genetics GRMs |
 | `mean_correct` | `True` | Apply full REML mean projection. Set `False` for a small speedup when y is standardised (correction is O(1/n)) |
 | `seed` | `42` | RNG seed for reproducible probe vectors |

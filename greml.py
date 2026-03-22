@@ -34,6 +34,7 @@ Avron & Toledo 2011 — variance analysis of Hutchinson estimator
 import numpy as np
 from scipy import linalg
 from scipy.linalg import cho_factor, cho_solve
+from scipy.linalg.lapack import get_lapack_funcs
 
 _TINY = 1e-14
 
@@ -64,6 +65,8 @@ def read_grm(prefix, dtype=np.float64):
     if len(raw) != n * (n + 1) // 2:
         raise ValueError(f"GRM size mismatch: expected {n*(n+1)//2} values, "
                          f"got {len(raw)} in {bin_file}")
+    if not np.isfinite(raw).all():
+        raise ValueError(f"GRM {bin_file} contains non-finite values.")
     K  = np.zeros((n, n), dtype=dtype)
     lo = 0
     for i in range(n):
@@ -95,6 +98,38 @@ def _he_warmstart(K_list, y):
     return theta
 
 
+def _validate_inputs(K_list, y, X=None, n_probes=None):
+    """Basic shape and finite-value checks for public GREML entry points."""
+    if not K_list:
+        raise ValueError("K_list must contain at least one GRM.")
+
+    y = np.asarray(y)
+    if y.ndim != 1:
+        raise ValueError("y must be a 1-D phenotype vector.")
+    if not np.isfinite(y).all():
+        raise ValueError("y contains non-finite values.")
+
+    n = y.shape[0]
+    for idx, Kk in enumerate(K_list, start=1):
+        Kk = np.asarray(Kk)
+        if Kk.shape != (n, n):
+            raise ValueError(
+                f"GRM {idx} has shape {Kk.shape}; expected ({n}, {n})."
+            )
+        if not np.isfinite(Kk).all():
+            raise ValueError(f"GRM {idx} contains non-finite values.")
+
+    if X is not None:
+        X = np.asarray(X)
+        if X.ndim != 2 or X.shape[0] != n:
+            raise ValueError(f"X has shape {X.shape}; expected ({n}, q).")
+        if not np.isfinite(X).all():
+            raise ValueError("X contains non-finite values.")
+
+    if n_probes is not None and n_probes < 1:
+        raise ValueError("n_probes must be at least 1.")
+
+
 def _newton_step(AI, grad, theta, constrain=True):
     """Regularised Newton step.
 
@@ -122,9 +157,10 @@ def _se_from_ai(AI, theta):
 
     Returns
     -------
-    h2       : ndarray (K,)   heritability per component
-    se_h2    : ndarray (K,)   SE(h²_k) via delta method
-    se_theta : ndarray (K+1,) SE(θ_k) = sqrt(AI⁻¹[k,k])
+    h2          : ndarray (K,)   heritability per component
+    se_h2       : ndarray (K,)   SE(h²_k) via delta method
+    se_theta    : ndarray (K+1,) SE(θ_k) = sqrt(AI⁻¹[k,k])
+    se_total_h2 : float          SE(sum_k h²_k) via delta method
     """
     K  = len(theta) - 1
     Vp = theta.sum()
@@ -137,10 +173,15 @@ def _se_from_ai(AI, theta):
             g     = -h2[k] * np.ones(K + 1) / Vp
             g[k] += 1.0 / Vp
             se_h2[k] = np.sqrt(max(g @ Cov @ g, 0.0))
+        h2_total = h2.sum()
+        g_total = np.concatenate([np.ones(K), np.zeros(1)]) / Vp
+        g_total -= h2_total * np.ones(K + 1) / Vp
+        se_total_h2 = float(np.sqrt(max(g_total @ Cov @ g_total, 0.0)))
     except Exception:
         se_theta = np.full(K + 1, np.nan)
         se_h2    = np.full(K, np.nan)
-    return h2, se_h2, se_theta
+        se_total_h2 = np.nan
+    return h2, se_h2, se_theta, se_total_h2
 
 
 # ── Projection helper ──────────────────────────────────────────────────────────
@@ -196,9 +237,10 @@ def greml_stochastic(K_list, y, n_probes=50, max_iter=30, tol=1e-5,
     y : ndarray, shape (n,)
         Phenotype vector.
     n_probes : int
-        Number of antithetic Rademacher probe vectors for the Hutchinson
-        trace estimator. 50 gives ~1% relative error; 30 is sufficient
-        for standardised phenotypes.
+        Number of Rademacher probe vectors for the Hutchinson trace
+        estimator. Probe pairs are antithetic when possible; odd probe
+        counts use one additional independent vector. 50 gives ~1%
+        relative error; 30 is sufficient for standardised phenotypes.
     max_iter : int
         Maximum AI-REML iterations.
     tol : float
@@ -224,9 +266,12 @@ def greml_stochastic(K_list, y, n_probes=50, max_iter=30, tol=1e-5,
         h2     : ndarray (K,)   — heritability estimates per component
         se     : ndarray (K,)   — standard errors (delta method from AI⁻¹)
         se_theta : ndarray (K+1,) — SE of raw variance components
+        se_total_h2 : float     — SE of sum_k h²_k
         theta  : ndarray (K+1,) — raw variance components (σ²_1,…,σ²_e)
         n_iter : int            — iterations taken
     """
+    _validate_inputs(K_list, y, X=X, n_probes=n_probes)
+
     n   = len(y)
     K   = len(K_list)
     rng = np.random.default_rng(seed)
@@ -241,10 +286,17 @@ def greml_stochastic(K_list, y, n_probes=50, max_iter=30, tol=1e-5,
         ones_col = np.ones((n, 1), dtype=np.float64)
         X_full   = np.hstack([ones_col, X]) if X is not None else ones_col
 
-    n_half = max(n_probes // 2, 1)
-    Zh = (rng.integers(0, 2, size=(n, n_half)) * 2 - 1).astype(dtype)
-    Z  = np.concatenate([Zh, -Zh], axis=1)
-    s  = Z.shape[1]
+    probe_blocks = []
+    n_pairs = n_probes // 2
+    if n_pairs:
+        Zh = (rng.integers(0, 2, size=(n, n_pairs)) * 2 - 1).astype(dtype)
+        probe_blocks.extend([Zh, -Zh])
+    if n_probes % 2:
+        probe_blocks.append(
+            (rng.integers(0, 2, size=(n, 1)) * 2 - 1).astype(dtype)
+        )
+    Z = np.concatenate(probe_blocks, axis=1)
+    s = Z.shape[1]
 
     AI_last = np.eye(K + 1, dtype=np.float64)
 
@@ -259,7 +311,7 @@ def greml_stochastic(K_list, y, n_probes=50, max_iter=30, tol=1e-5,
         np.fill_diagonal(V, d)
 
         try:
-            Lc = cho_factor(V, lower=True, check_finite=False)
+            Lc = cho_factor(V, lower=True, overwrite_a=True, check_finite=False)
         except linalg.LinAlgError:
             theta *= 1.1
             continue
@@ -272,6 +324,7 @@ def greml_stochastic(K_list, y, n_probes=50, max_iter=30, tol=1e-5,
             XVX_inv = np.linalg.inv(X_full.T @ VinvX)
             beta    = XVX_inv @ (VinvX.T @ y)
             Py      = Vinvy - (VinvX @ beta).astype(dtype)
+            VinvX_work = VinvX.astype(dtype)
         else:
             Py = Vinvy
 
@@ -302,7 +355,7 @@ def greml_stochastic(K_list, y, n_probes=50, max_iter=30, tol=1e-5,
         # Subtract tr(V⁻¹X(X'V⁻¹X)⁻¹X'V⁻¹K_k) to get tr(PK_k)
         if do_proj:
             for k in range(K):
-                KVX        = Kd[k].astype(np.float64) @ VinvX
+                KVX        = (Kd[k] @ VinvX_work).astype(np.float64)
                 traces[k] -= np.trace(XVX_inv @ (VinvX.T @ KVX))
             traces[K] -= np.trace(XVX_inv @ (VinvX.T @ VinvX))
 
@@ -317,9 +370,9 @@ def greml_stochastic(K_list, y, n_probes=50, max_iter=30, tol=1e-5,
         if it >= 3 and np.max(np.abs(delta)) < tol:
             break
 
-    h2, se_h2, se_theta = _se_from_ai(AI_last, theta)
+    h2, se_h2, se_theta, se_total_h2 = _se_from_ai(AI_last, theta)
     return {'h2': h2, 'se': se_h2, 'se_theta': se_theta,
-            'theta': theta, 'n_iter': it + 1}
+            'theta': theta, 'n_iter': it + 1, 'se_total_h2': se_total_h2}
 
 
 def greml_exact(K_list, y, max_iter=30, tol=1e-6, X=None, constrain=True,
@@ -342,11 +395,14 @@ def greml_exact(K_list, y, max_iter=30, tol=1e-6, X=None, constrain=True,
 
     Returns
     -------
-    dict with keys: h2, se, se_theta, theta, n_iter
+    dict with keys: h2, se, se_theta, se_total_h2, theta, n_iter
     """
+    _validate_inputs(K_list, y, X=X)
+
     n  = len(y)
     K  = len(K_list)
     In = np.eye(n, dtype=np.float64)
+    potri = get_lapack_funcs("potri", (In,))
 
     ones_col = np.ones((n, 1), dtype=np.float64)
     X_full   = np.hstack([ones_col, X]) if X is not None else ones_col
@@ -362,16 +418,20 @@ def greml_exact(K_list, y, max_iter=30, tol=1e-6, X=None, constrain=True,
             V += theta[k] * K_list[k]
 
         try:
-            Lc = cho_factor(V, lower=True, check_finite=False)
+            Lc = cho_factor(V, lower=True, overwrite_a=True, check_finite=False)
         except linalg.LinAlgError:
             theta *= 1.1
             continue
 
-        Vinv    = cho_solve(Lc, In, check_finite=False)
         VinvX   = cho_solve(Lc, X_full, check_finite=False)
         XVX_inv = np.linalg.inv(X_full.T @ VinvX)
         beta    = XVX_inv @ (VinvX.T @ y)
         Py      = cho_solve(Lc, y, check_finite=False) - VinvX @ beta
+        Vinv_tri, info = potri(Lc[0].copy(order="F"), lower=1, overwrite_c=1)
+        if info != 0:
+            raise linalg.LinAlgError(f"potri failed with info={info}")
+        Vinv = np.tril(Vinv_tri)
+        Vinv += np.tril(Vinv, k=-1).T
 
         KPy  = np.column_stack([K_list[k] @ Py for k in range(K)] + [Py])
         # P(KPy) = V⁻¹(KPy) − V⁻¹X(X'V⁻¹X)⁻¹X'V⁻¹(KPy)
@@ -402,6 +462,6 @@ def greml_exact(K_list, y, max_iter=30, tol=1e-6, X=None, constrain=True,
         if it >= 3 and np.max(np.abs(delta)) < tol:
             break
 
-    h2, se_h2, se_theta = _se_from_ai(AI_last, theta)
+    h2, se_h2, se_theta, se_total_h2 = _se_from_ai(AI_last, theta)
     return {'h2': h2, 'se': se_h2, 'se_theta': se_theta,
-            'theta': theta, 'n_iter': it + 1}
+            'theta': theta, 'n_iter': it + 1, 'se_total_h2': se_total_h2}

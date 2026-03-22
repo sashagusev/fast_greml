@@ -32,11 +32,6 @@ Output:
 import argparse
 import os
 import sys
-import numpy as np
-
-# Allow running from the fast_greml directory or its parent
-sys.path.insert(0, os.path.dirname(__file__))
-from greml import read_grm, greml_stochastic, greml_exact
 
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
@@ -97,10 +92,12 @@ def read_grm_prefixes(args):
 def read_pheno(path):
     """Read FID IID PHENO file; return (ordered IID list, pheno dict).
     Missing phenotypes (-9 or NA) are excluded."""
+    import math
+
     iids   = []
     phenos = {}
     with open(path) as fh:
-        for line in fh:
+        for line_no, line in enumerate(fh, start=1):
             parts = line.split()
             if len(parts) < 3:
                 continue
@@ -108,8 +105,17 @@ def read_pheno(path):
             if raw in ("-9", "NA", "na", "NaN", "."):
                 continue
             key = (fid, iid)
+            if key in phenos:
+                raise ValueError(
+                    f"Duplicate phenotype entry for {fid}/{iid} on line {line_no}."
+                )
             iids.append(key)
-            phenos[key] = float(raw)
+            value = float(raw)
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"Phenotype for {fid}/{iid} on line {line_no} is not finite."
+                )
+            phenos[key] = value
     return iids, phenos
 
 
@@ -117,9 +123,12 @@ def read_covar(path):
     """Read FID IID COV1 [COV2 …] covariate file.
     Returns dict mapping (FID, IID) -> covariate row (1-D float array).
     Rows with any missing value (-9 or NA) are excluded."""
+    import numpy as np
+
     covars = {}
+    width = None
     with open(path) as fh:
-        for line in fh:
+        for line_no, line in enumerate(fh, start=1):
             parts = line.split()
             if len(parts) < 3:
                 continue
@@ -127,13 +136,32 @@ def read_covar(path):
             vals = parts[2:]
             if any(v in ("-9", "NA", "na", "NaN", ".") for v in vals):
                 continue
-            covars[(fid, iid)] = np.array([float(v) for v in vals])
+            key = (fid, iid)
+            if key in covars:
+                raise ValueError(
+                    f"Duplicate covariate entry for {fid}/{iid} on line {line_no}."
+                )
+            row = np.array([float(v) for v in vals], dtype=np.float64)
+            if not np.isfinite(row).all():
+                raise ValueError(
+                    f"Covariates for {fid}/{iid} on line {line_no} are not finite."
+                )
+            if width is None:
+                width = row.shape[0]
+            elif row.shape[0] != width:
+                raise ValueError(
+                    f"Inconsistent covariate width on line {line_no}: "
+                    f"expected {width}, got {row.shape[0]}."
+                )
+            covars[key] = row
     return covars
 
 
 def align_covar_to_grm(ids_grm, covars):
     """Return covariate matrix (n, q) aligned to GRM row order.
     Exits if any GRM individual is missing from the covariate file."""
+    import numpy as np
+
     rows = []
     for fid, iid in ids_grm:
         key = (fid, iid)
@@ -152,11 +180,11 @@ def align_covar_to_grm(ids_grm, covars):
 def align_pheno_to_grm(ids_grm, pheno_iids, phenos):
     """Return phenotype vector aligned to GRM row order.
 
-    Individuals present in the GRM but missing from the phenotype file
-    are dropped with a warning; this subset is returned as the active set.
-    For simplicity this implementation requires all GRM individuals to have
-    a phenotype (matching GCTA's default behaviour).
+    This implementation requires all GRM individuals to have a phenotype
+    (matching GCTA's default behaviour).
     """
+    import numpy as np
+
     pheno_set = set(pheno_iids)
     y    = []
     kept = []
@@ -177,6 +205,7 @@ def write_hsq(path, K_list, result, n):
     h2       = result["h2"]
     se_h2    = result["se"]
     se_theta = result["se_theta"]
+    se_total_h2 = result["se_total_h2"]
     theta    = result["theta"]
     K        = len(h2)
     Vp       = theta.sum()
@@ -188,7 +217,7 @@ def write_hsq(path, K_list, result, n):
     lines.append(f"Vp\t{Vp:.6f}\tNA")
     for k in range(K):
         lines.append(f"V(G{k+1})/Vp\t{h2[k]:.6f}\t{se_h2[k]:.6f}")
-    lines.append(f"Sum of V(G)/Vp\t{h2.sum():.6f}\t{float(np.sqrt(np.sum(se_h2**2))):.6f}")
+    lines.append(f"Sum of V(G)/Vp\t{h2.sum():.6f}\t{se_total_h2:.6f}")
     lines += ["logL\tNA", "logL0\tNA", "LRT\tNA", "df\tNA", "Pval\tNA"]
     lines.append(f"n\t{n}")
 
@@ -202,11 +231,17 @@ def main():
     parser = build_parser()
     args   = parser.parse_args()
 
-    # Optional: set BLAS thread count before importing scipy/numpy internals
+    # Optional: set BLAS thread count before importing numpy/scipy.
     if args.thread_num is not None:
         for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                     "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
             os.environ[var] = str(args.thread_num)
+
+    import numpy as np
+
+    # Allow running from the fast_greml directory or its parent.
+    sys.path.insert(0, os.path.dirname(__file__))
+    from greml import read_grm, greml_stochastic, greml_exact
 
     # ── Load GRMs ──────────────────────────────────────────────────────────────
     prefixes = read_grm_prefixes(args)
@@ -216,26 +251,35 @@ def main():
     dtype   = np.float32 if args.method == "stochastic" else np.float64
     K_list  = []
     ids_grm = None
-    for pfx in prefixes:
-        Km, ids = read_grm(pfx, dtype=dtype)
-        K_list.append(Km)
-        if ids_grm is None:
-            ids_grm = ids
-        elif [x[1] for x in ids] != [x[1] for x in ids_grm]:
-            sys.exit(f"Error: GRM {pfx} has different individuals from the first GRM.")
+    try:
+        for pfx in prefixes:
+            Km, ids = read_grm(pfx, dtype=dtype)
+            K_list.append(Km)
+            if ids_grm is None:
+                ids_grm = ids
+            elif ids != ids_grm:
+                sys.exit(f"Error: GRM {pfx} has different individuals from the first GRM.")
+    except ValueError as exc:
+        sys.exit(f"Error: {exc}")
 
     n = K_list[0].shape[0]
     print(f" done  (n={n}, K={K})")
 
     # ── Load and align phenotype ───────────────────────────────────────────────
-    pheno_iids, phenos = read_pheno(args.pheno)
+    try:
+        pheno_iids, phenos = read_pheno(args.pheno)
+    except ValueError as exc:
+        sys.exit(f"Error: {exc}")
     y, _ = align_pheno_to_grm(ids_grm, pheno_iids, phenos)
     print(f"Phenotype: {len(y)} individuals, "
           f"mean={y.mean():.4f}, sd={y.std():.4f}")
 
     X_cov = None
     if args.covar:
-        covars = read_covar(args.covar)
+        try:
+            covars = read_covar(args.covar)
+        except ValueError as exc:
+            sys.exit(f"Error: {exc}")
         X_cov  = align_covar_to_grm(ids_grm, covars)
         print(f"Covariates: {X_cov.shape[1]} column(s) loaded")
 
@@ -282,7 +326,7 @@ def main():
     for k in range(K):
         print(f"  V(G{k+1})/Vp   {h2[k]:>10.4f}  {se_h2[k]:>10.4f}")
     print("-" * 40)
-    print(f"  {'Sum':<11s}  {h2.sum():>10.4f}  {float(np.sqrt(np.sum(se_h2**2))):>10.4f}")
+    print(f"  {'Sum':<11s}  {h2.sum():>10.4f}  {result['se_total_h2']:>10.4f}")
 
 
 if __name__ == "__main__":

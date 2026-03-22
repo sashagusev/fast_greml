@@ -74,6 +74,8 @@ def build_parser():
                    help="Accepted for GCTA compatibility; LRT is never computed here")
     p.add_argument("--thread-num", type=int, default=None, metavar="N",
                    help="BLAS/OpenMP thread count")
+    p.add_argument("--eigendecomp", action="store_true",
+                   help="Enable the single-component exact eigendecomposition path")
 
     return p
 
@@ -301,7 +303,13 @@ def main():
             verbose=True,
         )
     else:
-        result = greml_exact(K_list, y, X=X_cov, constrain=constrain, verbose=True)
+        result = greml_exact(
+            K_list, y,
+            X=X_cov,
+            constrain=constrain,
+            verbose=True,
+            use_eigendecomp=args.eigendecomp,
+        )
 
     elapsed = time.perf_counter() - t0
     print(f"Converged in {result['n_iter']} iterations ({elapsed:.2f}s)")

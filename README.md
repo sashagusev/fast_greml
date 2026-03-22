@@ -11,9 +11,9 @@ Fast multi-component GREML for partitioned heritability estimation from pre-comp
 | Method | Trace computation | Precision | Speed vs GCTA | Use when |
 |---|---|---|---|---|
 | `greml_stochastic` | Hutchinson (s=50 probes) | float32 Chol | ~20× | n > 3k or many runs |
-| `greml_exact` | Explicit V⁻¹ | float64 | ~2× | n ≤ 6k, exact reference |
+| `greml_exact` | Explicit V⁻¹ / eigensystem for K=1 | float64 | ~2× | n ≤ 6k, exact reference |
 
-Both methods use an HE-regression warm start that reduces AI-REML iterations from ~11 (GCTA's EM initialisation) to ~4, and compute the AI matrix exactly (pure quadratic forms) so SE estimates are identical to GCTA's Cramér–Rao bound regardless of which method is used.
+Both methods use an HE-regression warm start that reduces AI-REML iterations from ~11 (GCTA's EM initialisation) to ~4, and compute the AI matrix exactly (pure quadratic forms) so SE estimates are identical to GCTA's Cramér–Rao bound regardless of which method is used. Intercept-only REML is handled with a specialized exact projection path. In the Python API, `greml_exact` uses a one-time eigendecomposition automatically when `K=1`, reusing that eigensystem on repeated fits of the same GRM object; the CLI keeps the dense exact path by default and enables the eigen-based path only with `--eigendecomp`. `greml_stochastic` can optionally use a small compiled kernel for the GRM matvec/trace loop on macOS.
 
 Empirical speedups at n=5,000, K=3 components, single thread:
 
@@ -34,6 +34,18 @@ pip install numpy scipy
 ```
 
 No other dependencies. The code calls LAPACK (via SciPy) directly; on Apple Silicon it uses the Accelerate framework automatically through NumPy/SciPy.
+
+### Optional compiled stochastic kernel
+
+The stochastic path will use `_greml_accel` automatically if it is available. Build it in-place with:
+
+```bash
+python3 setup.py build_ext --inplace
+```
+
+This extension uses NumPy's C API plus Apple's Accelerate BLAS and falls back to the pure-Python/NumPy implementation if it is not built.
+
+For exact one-component runs, the CLI uses the dense exact path by default. Pass `--eigendecomp` to enable the eigen-based exact path; when enabled, the CLI reports when it computes or reuses the eigendecomposition. In the Python API, `greml_exact([K], y)` uses the eigen-based path by default; pass `use_eigendecomp=False` to force the dense exact path instead.
 
 ## Usage
 
@@ -67,9 +79,25 @@ result = greml_stochastic(K_list, y)
 # Exact reference (recommended for n ≤ 6k)
 result = greml_exact(K_list, y)
 
+# Single-component exact GREML uses the eigen-based path by default
+result = greml_exact([K1], y)
+
+# Force the dense exact path for single-component GREML
+result = greml_exact([K1], y, use_eigendecomp=False)
+
 print(result['h2'])    # array([h2_1, h2_2, h2_3])
 print(result['se'])    # array([se_1, se_2, se_3])
 print(result['n_iter'])
+```
+
+### Command-line usage
+
+```bash
+# Dense exact path (default)
+python3 run_greml.py --grm path/to/grm --pheno pheno.txt --method exact
+
+# Enable the eigen-based single-component exact path
+python3 run_greml.py --grm path/to/grm --pheno pheno.txt --method exact --eigendecomp
 ```
 
 ### Return value
@@ -80,6 +108,7 @@ Both functions return a dict:
 |---|---|---|
 | `h2` | `ndarray (K,)` | Heritability per component: θ_k / Σθ |
 | `se` | `ndarray (K,)` | SE via delta method from AI⁻¹ |
+| `se_theta` | `ndarray (K+1,)` | SE of the raw variance components |
 | `se_total_h2` | `float` | SE of total genetic variance fraction: Σ_k θ_k / Σθ |
 | `theta` | `ndarray (K+1,)` | Raw variance components σ²_1,…,σ²_e |
 | `n_iter` | `int` | AI-REML iterations taken |
@@ -105,6 +134,6 @@ where `g_k = ½(yᵀ P K_k P y − tr(P K_k))` is the REML score and `AI[j,k] = 
 
 **Stochastic traces** (Hutchinson 1990): `tr(V⁻¹ K_k) ≈ (1/s) Σᵢ zᵢᵀ Kₖ (V⁻¹ zᵢ)` with antithetic Rademacher probes. This replaces the O(n³) V⁻¹ materialisation with O(s·n²) triangular solves, batched into a single BLAS-3 call.
 
-**Exact traces** in `greml_exact`: `tr(V⁻¹ K_k) = (V⁻¹ ⊙ K_k).sum()` after forming V⁻¹ = cho_solve(L, I) — same as GCTA.
+**Exact traces** in `greml_exact`: for the dense multi-component path, traces are computed from the explicit inverse `V⁻¹` formed from the Cholesky factor. For the single-component path, the model is diagonalised once and exact traces are evaluated in the rotated basis.
 
 **The AI matrix is always computed exactly** (as quadratic forms `(K_k Py)ᵀ V⁻¹ (K_j Py)`) in both methods, so SE estimates are at the Cramér–Rao bound regardless of `n_probes`.

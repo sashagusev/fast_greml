@@ -32,11 +32,18 @@ Avron & Toledo 2011 — variance analysis of Hutchinson estimator
 """
 
 import numpy as np
+import weakref
 from scipy import linalg
 from scipy.linalg import cho_factor, cho_solve
 from scipy.linalg.lapack import get_lapack_funcs
 
 _TINY = 1e-14
+_SINGLE_GRM_EIG_CACHE = {}
+
+try:
+    from _greml_accel import stochastic_ops as _stochastic_ops_accel
+except ImportError:
+    _stochastic_ops_accel = None
 
 
 # ── GRM I/O ────────────────────────────────────────────────────────────────────
@@ -128,6 +135,58 @@ def _validate_inputs(K_list, y, X=None, n_probes=None):
 
     if n_probes is not None and n_probes < 1:
         raise ValueError("n_probes must be at least 1.")
+
+
+def _stochastic_component_ops(Kd, Py, VinvZ, Z, Vinv1=None):
+    """Compute KPy and stochastic trace terms, optionally with u'K_ku."""
+    if _stochastic_ops_accel is not None:
+        try:
+            return _stochastic_ops_accel(
+                Kd,
+                np.ascontiguousarray(Py),
+                np.ascontiguousarray(VinvZ),
+                np.ascontiguousarray(Z),
+                None if Vinv1 is None else np.ascontiguousarray(Vinv1),
+            )
+        except (TypeError, ValueError):
+            pass
+
+    K = len(Kd)
+    s = Z.shape[1]
+    KPy = np.empty((Py.shape[0], K), dtype=Py.dtype)
+    traces = np.empty(K, dtype=np.float64)
+    uKu = np.empty(K, dtype=np.float64) if Vinv1 is not None else None
+    Vinv1_64 = None if Vinv1 is None else Vinv1.astype(np.float64, copy=False)
+    for k, Kk in enumerate(Kd):
+        KPy[:, k] = Kk @ Py
+        traces[k] = float((Z * (Kk @ VinvZ)).sum(dtype=np.float64)) / s
+        if Vinv1 is not None:
+            Ku = Kk @ Vinv1
+            uKu[k] = float(np.dot(Vinv1_64, Ku.astype(np.float64, copy=False)))
+    return KPy, traces, uKu
+
+
+def _get_single_grm_eigendecomp(K):
+    """Return cached eigendecomposition for a single-GRM exact fit."""
+    key = id(K)
+    cached = _SINGLE_GRM_EIG_CACHE.get(key)
+    if cached is not None:
+        ref, eigvals, U = cached
+        if ref() is K:
+            return eigvals, U, True
+        _SINGLE_GRM_EIG_CACHE.pop(key, None)
+
+    Kd = np.asarray(K, dtype=np.float64)
+    eigvals, U = np.linalg.eigh(Kd)
+    try:
+        _SINGLE_GRM_EIG_CACHE[key] = (
+            weakref.ref(K, lambda _ref, key=key: _SINGLE_GRM_EIG_CACHE.pop(key, None)),
+            eigvals,
+            U,
+        )
+    except TypeError:
+        pass
+    return eigvals, U, False
 
 
 def _newton_step(AI, grad, theta, constrain=True):
@@ -282,9 +341,11 @@ def greml_stochastic(K_list, y, n_probes=50, max_iter=30, tol=1e-5,
 
     # Build design matrix (intercept always included)
     do_proj = (X is not None) or mean_correct
+    intercept_only = do_proj and X is None
     if do_proj:
         ones_col = np.ones((n, 1), dtype=np.float64)
         X_full   = np.hstack([ones_col, X]) if X is not None else ones_col
+        ones_work = np.ones(n, dtype=dtype)
 
     probe_blocks = []
     n_pairs = n_probes // 2
@@ -318,7 +379,12 @@ def greml_stochastic(K_list, y, n_probes=50, max_iter=30, tol=1e-5,
 
         # Py = V⁻¹y, then project out fixed effects
         Vinvy = cho_solve(Lc, yd, check_finite=False)
-        if do_proj:
+        if intercept_only:
+            Vinv1 = cho_solve(Lc, ones_work, check_finite=False)
+            denom = float(np.sum(Vinv1, dtype=np.float64))
+            beta = float(np.sum(Vinvy, dtype=np.float64)) / denom
+            Py = Vinvy - Vinv1 * dtype(beta)
+        elif do_proj:
             VinvX   = cho_solve(Lc, X_full.astype(dtype),
                                 check_finite=False).astype(np.float64)
             XVX_inv = np.linalg.inv(X_full.T @ VinvX)
@@ -328,13 +394,25 @@ def greml_stochastic(K_list, y, n_probes=50, max_iter=30, tol=1e-5,
         else:
             Py = Vinvy
 
+        VinvZ = cho_solve(Lc, Z, check_finite=False)
+        if intercept_only:
+            KPy_gen, traces_gen, uKu = _stochastic_component_ops(
+                Kd, Py, VinvZ, Z, Vinv1=Vinv1
+            )
+        else:
+            KPy_gen, traces_gen, _ = _stochastic_component_ops(Kd, Py, VinvZ, Z)
+
         KPy = np.empty((n, K + 1), dtype=dtype)
-        for k in range(K):
-            KPy[:, k] = Kd[k] @ Py
+        KPy[:, :K] = KPy_gen
         KPy[:, K] = Py
 
         # AI matrix: P(KPy) = V⁻¹(KPy) − V⁻¹X(X'V⁻¹X)⁻¹X'V⁻¹(KPy)
-        if do_proj:
+        if intercept_only:
+            VinvKPy = cho_solve(Lc, KPy, check_finite=False).astype(np.float64)
+            Vinv1_64 = Vinv1.astype(np.float64, copy=False)
+            coeff = (Vinv1_64 @ KPy.astype(np.float64)) / denom
+            PKPy64 = VinvKPy - np.outer(Vinv1_64, coeff)
+        elif do_proj:
             VinvKPy = cho_solve(Lc, KPy, check_finite=False).astype(np.float64)
             PKPy64  = VinvKPy - VinvX @ (XVX_inv @ (VinvX.T @ KPy.astype(np.float64)))
         else:
@@ -346,14 +424,16 @@ def greml_stochastic(K_list, y, n_probes=50, max_iter=30, tol=1e-5,
         quad    = np.einsum('n,nk->k', Py.astype(np.float64), KPy64)
 
         # Stochastic traces: tr(V⁻¹K_k) via Hutchinson
-        VinvZ  = cho_solve(Lc, Z, check_finite=False)
         traces = np.empty(K + 1, dtype=np.float64)
-        for k in range(K):
-            traces[k] = float((Z * (Kd[k] @ VinvZ)).sum()) / s
+        traces[:K] = traces_gen
         traces[K] = float((Z * VinvZ).sum()) / s
 
         # Subtract tr(V⁻¹X(X'V⁻¹X)⁻¹X'V⁻¹K_k) to get tr(PK_k)
-        if do_proj:
+        if intercept_only:
+            traces[:K] -= uKu / denom
+            traces[K] -= float(np.dot(Vinv1.astype(np.float64, copy=False),
+                                      Vinv1.astype(np.float64, copy=False))) / denom
+        elif do_proj:
             for k in range(K):
                 KVX        = (Kd[k] @ VinvX_work).astype(np.float64)
                 traces[k] -= np.trace(XVX_inv @ (VinvX.T @ KVX))
@@ -375,37 +455,20 @@ def greml_stochastic(K_list, y, n_probes=50, max_iter=30, tol=1e-5,
             'theta': theta, 'n_iter': it + 1, 'se_total_h2': se_total_h2}
 
 
-def greml_exact(K_list, y, max_iter=30, tol=1e-6, X=None, constrain=True,
-                verbose=False):
-    """AI-REML with exact trace computation via explicit V⁻¹.
-
-    Identical algorithm to GCTA's GREML with two differences:
-    HE warm start (fewer iterations) and single-threaded Python/Accelerate
-    instead of GCTA's parallelised C++. About 2× faster than GCTA at n=5k.
-    Scales as O(n³) per iteration; use greml_stochastic for n > 6k.
-
-    Parameters
-    ----------
-    K_list : list of ndarray, each shape (n, n)
-    y : ndarray, shape (n,)
-    max_iter : int
-    tol : float
-    X : ndarray (n, q) or None
-        Covariate matrix WITHOUT intercept (added automatically).
-
-    Returns
-    -------
-    dict with keys: h2, se, se_theta, se_total_h2, theta, n_iter
-    """
+def _greml_exact_dense_ai(K_list, y, max_iter=30, tol=1e-6, X=None,
+                          constrain=True, verbose=False):
+    """Dense exact AI-REML path used for K > 1 and regression testing."""
     _validate_inputs(K_list, y, X=X)
 
     n  = len(y)
     K  = len(K_list)
     In = np.eye(n, dtype=np.float64)
     potri = get_lapack_funcs("potri", (In,))
+    ones = np.ones(n, dtype=np.float64)
 
     ones_col = np.ones((n, 1), dtype=np.float64)
     X_full   = np.hstack([ones_col, X]) if X is not None else ones_col
+    intercept_only = X is None
 
     theta   = _he_warmstart(K_list, y)
     AI_last = np.eye(K + 1)
@@ -423,10 +486,17 @@ def greml_exact(K_list, y, max_iter=30, tol=1e-6, X=None, constrain=True,
             theta *= 1.1
             continue
 
-        VinvX   = cho_solve(Lc, X_full, check_finite=False)
-        XVX_inv = np.linalg.inv(X_full.T @ VinvX)
-        beta    = XVX_inv @ (VinvX.T @ y)
-        Py      = cho_solve(Lc, y, check_finite=False) - VinvX @ beta
+        if intercept_only:
+            Vinvy = cho_solve(Lc, y, check_finite=False)
+            Vinv1 = cho_solve(Lc, ones, check_finite=False)
+            denom = float(np.sum(Vinv1))
+            beta = float(np.sum(Vinvy)) / denom
+            Py = Vinvy - Vinv1 * beta
+        else:
+            VinvX   = cho_solve(Lc, X_full, check_finite=False)
+            XVX_inv = np.linalg.inv(X_full.T @ VinvX)
+            beta    = XVX_inv @ (VinvX.T @ y)
+            Py      = cho_solve(Lc, y, check_finite=False) - VinvX @ beta
         Vinv_tri, info = potri(Lc[0].copy(order="F"), lower=1, overwrite_c=1)
         if info != 0:
             raise linalg.LinAlgError(f"potri failed with info={info}")
@@ -435,7 +505,11 @@ def greml_exact(K_list, y, max_iter=30, tol=1e-6, X=None, constrain=True,
 
         KPy  = np.column_stack([K_list[k] @ Py for k in range(K)] + [Py])
         # P(KPy) = V⁻¹(KPy) − V⁻¹X(X'V⁻¹X)⁻¹X'V⁻¹(KPy)
-        PKPy = Vinv @ KPy - VinvX @ (XVX_inv @ (VinvX.T @ KPy))
+        if intercept_only:
+            coeff = (Vinv1 @ KPy) / denom
+            PKPy = Vinv @ KPy - np.outer(Vinv1, coeff)
+        else:
+            PKPy = Vinv @ KPy - VinvX @ (XVX_inv @ (VinvX.T @ KPy))
 
         AI      = 0.5 * (KPy.T @ PKPy)
         AI_last = AI
@@ -446,10 +520,15 @@ def greml_exact(K_list, y, max_iter=30, tol=1e-6, X=None, constrain=True,
         for k in range(K):
             traces[k] = (Vinv * K_list[k]).sum()
         traces[K] = np.trace(Vinv)
-        for k in range(K):
-            KVX        = K_list[k] @ VinvX
-            traces[k] -= np.trace(XVX_inv @ (VinvX.T @ KVX))
-        traces[K] -= np.trace(XVX_inv @ (VinvX.T @ VinvX))
+        if intercept_only:
+            for k in range(K):
+                traces[k] -= float(Vinv1 @ (K_list[k] @ Vinv1)) / denom
+            traces[K] -= float(Vinv1 @ Vinv1) / denom
+        else:
+            for k in range(K):
+                KVX        = K_list[k] @ VinvX
+                traces[k] -= np.trace(XVX_inv @ (VinvX.T @ KVX))
+            traces[K] -= np.trace(XVX_inv @ (VinvX.T @ VinvX))
 
         grad           = 0.5 * (quad - traces)
         theta, delta   = _newton_step(AI_last, grad, theta, constrain=constrain)
@@ -465,3 +544,112 @@ def greml_exact(K_list, y, max_iter=30, tol=1e-6, X=None, constrain=True,
     h2, se_h2, se_theta, se_total_h2 = _se_from_ai(AI_last, theta)
     return {'h2': h2, 'se': se_h2, 'se_theta': se_theta,
             'theta': theta, 'n_iter': it + 1, 'se_total_h2': se_total_h2}
+
+
+def greml_exact_single(K, y, max_iter=30, tol=1e-6, X=None, constrain=True,
+                       verbose=False):
+    """Exact AI-REML for a single GRM via one eigendecomposition.
+
+    After diagonalising K = U diag(λ) U', each AI-REML iteration reduces to
+    O(n p + n) operations in the rotated basis instead of repeated O(n^3)
+    dense factorizations. The eigendecomposition is cached per GRM object so
+    repeated fits on the same matrix amortise the O(n^3) setup cost.
+    """
+    _validate_inputs([K], y, X=X)
+
+    n = len(y)
+    Kd = np.asarray(K, dtype=np.float64)
+    eigvals, U, cache_hit = _get_single_grm_eigendecomp(K)
+    if verbose:
+        status = "reusing cached eigendecomposition" if cache_hit else "computing eigendecomposition"
+        print(f"  single-component exact GREML: {status}")
+    z = U.T @ y
+
+    ones_col = np.ones((n, 1), dtype=np.float64)
+    X_full = np.hstack([ones_col, X]) if X is not None else ones_col
+    W = U.T @ X_full
+
+    theta = _he_warmstart([Kd], y)
+    AI_last = np.eye(2, dtype=np.float64)
+
+    def apply_p_rot(inv_v, xvx_chol, vec):
+        rhs = W.T @ (inv_v * vec)
+        coeff = cho_solve(xvx_chol, rhs, check_finite=False)
+        return inv_v * vec - inv_v * (W @ coeff)
+
+    for it in range(max_iter):
+        if constrain:
+            theta = np.clip(theta, _TINY, None)
+
+        v = theta[0] * eigvals + theta[1]
+        min_v = float(np.min(v))
+        if min_v <= _TINY:
+            theta[1] += (_TINY - min_v) + 1e-12
+            continue
+
+        inv_v = 1.0 / v
+        XVX = W.T @ (inv_v[:, None] * W)
+        try:
+            xvx_chol = cho_factor(XVX, lower=True, check_finite=False)
+        except linalg.LinAlgError:
+            theta *= 1.1
+            continue
+
+        beta_rhs = W.T @ (inv_v * z)
+        beta = cho_solve(xvx_chol, beta_rhs, check_finite=False)
+        Py_rot = inv_v * (z - W @ beta)
+
+        KPy_rot = np.column_stack([eigvals * Py_rot, Py_rot])
+        PKPy_rot = np.column_stack([
+            apply_p_rot(inv_v, xvx_chol, KPy_rot[:, 0]),
+            apply_p_rot(inv_v, xvx_chol, KPy_rot[:, 1]),
+        ])
+
+        AI = 0.5 * (KPy_rot.T @ PKPy_rot)
+        AI_last = AI
+        quad = np.array([
+            float(Py_rot @ KPy_rot[:, 0]),
+            float(Py_rot @ KPy_rot[:, 1]),
+        ])
+
+        lambda_weight = (eigvals * inv_v * inv_v)[:, None] * W
+        resid_weight = (inv_v * inv_v)[:, None] * W
+        trace_g = np.sum(eigvals * inv_v)
+        trace_e = np.sum(inv_v)
+        trace_g -= np.trace(cho_solve(
+            xvx_chol, W.T @ lambda_weight, check_finite=False
+        ))
+        trace_e -= np.trace(cho_solve(
+            xvx_chol, W.T @ resid_weight, check_finite=False
+        ))
+        grad = 0.5 * (quad - np.array([trace_g, trace_e]))
+
+        theta, delta = _newton_step(AI_last, grad, theta, constrain=constrain)
+        if verbose:
+            Vp = theta.sum()
+            h2v = theta[0] / Vp
+            print(f"  iter {it+1:2d}:  h²=[{h2v:.4f}]  max|Δθ|={np.max(np.abs(delta)):.2e}")
+        if it >= 3 and np.max(np.abs(delta)) < tol:
+            break
+
+    h2, se_h2, se_theta, se_total_h2 = _se_from_ai(AI_last, theta)
+    return {'h2': h2, 'se': se_h2, 'se_theta': se_theta,
+            'theta': theta, 'n_iter': it + 1, 'se_total_h2': se_total_h2}
+
+
+def greml_exact(K_list, y, max_iter=30, tol=1e-6, X=None, constrain=True,
+                verbose=False, use_eigendecomp=True):
+    """AI-REML with exact traces.
+
+    Uses a dedicated eigen-based solver for the single-component case and the
+    dense AI-REML path for multi-component models.
+    """
+    if len(K_list) == 1 and use_eigendecomp:
+        return greml_exact_single(
+            K_list[0], y, max_iter=max_iter, tol=tol, X=X,
+            constrain=constrain, verbose=verbose
+        )
+    return _greml_exact_dense_ai(
+        K_list, y, max_iter=max_iter, tol=tol, X=X,
+        constrain=constrain, verbose=verbose
+    )
